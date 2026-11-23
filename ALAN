@@ -76,7 +76,9 @@ local ThrowZone = Map and Map:WaitForChild("ThrowArea"):WaitForChild("Platform")
 local SellZone = Map and Map:WaitForChild("Market"):WaitForChild("SellStand"):WaitForChild("Zone")
 
 local ConfigShared = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Config"))
+local NumberFormat = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("NumberFormat"))
 local Inventory = require(LocalPlayer:WaitForChild("PlayerScripts"):WaitForChild("Client"):WaitForChild("Inventory"))
+local PlotMarker = require(LocalPlayer:WaitForChild("PlayerScripts"):WaitForChild("Client"):WaitForChild("PlotMarker"))
 
 -- 6. Resilient Script Fetcher (Handles 302 redirects & HTTP drops on Mobile Executors)
 local httpRequest = (syn and syn.request) or (http and http.request) or http_request or request
@@ -127,6 +129,12 @@ end
 
 -- 8. State Configuration
 local Config = {
+    AutoTrain = false,
+    TrainFor = 60,
+    ThrowFor = 60,
+    AutoBuyTrain = false,
+    AutoBuyHarpoons = false,
+    AutoBuyTrails = false,
     AutoThrow = false,
     PerfectThrow = true,
     AutoSell = false,
@@ -191,6 +199,12 @@ local function saveConfig()
     pcall(function()
         safeMakeFolder(FOLDER_NAME)
         local data = {
+            AutoTrain = Config.AutoTrain,
+            TrainFor = Config.TrainFor,
+            ThrowFor = Config.ThrowFor,
+            AutoBuyTrain = Config.AutoBuyTrain,
+            AutoBuyHarpoons = Config.AutoBuyHarpoons,
+            AutoBuyTrails = Config.AutoBuyTrails,
             AutoThrow = Config.AutoThrow,
             PerfectThrow = Config.PerfectThrow,
             AutoSell = Config.AutoSell,
@@ -260,11 +274,90 @@ LocalPlayer.Idled:Connect(function()
     end
 end)
 
--- 11. Hook AutoPlay & 100% Perfect Throw
+-- 11. Cycle State Tracking & Auto-Train / Throw Helpers
+local CycleState = {
+    CurrentPhase = "Idle", -- "Train", "Throw", "Idle"
+    TimeRemaining = 0,
+    TotalX2Bonuses = 0,
+    CurXp = 0,
+    NeedXp = 100,
+    Level = 1,
+    BarName = "Wooden Bar",
+    XpPerRep = 1,
+    LastDino = "None",
+    ReachStuds = 0,
+    ZoneText = "Mud 1/3",
+    Food = "Bacon"
+}
+
+local function getZoneInfo(dist)
+    for _, z in ipairs(ConfigShared.Zones or {}) do
+        if dist >= (z.From or 0) and dist < (z.To or math.huge) then
+            local span = (z.To - z.From)
+            local progress = math.clamp((dist - z.From) / (span > 0 and span or 1), 0, 0.999)
+            local totalSec = z.Sections or 3
+            local sec = math.floor(progress * totalSec) + 1
+            return z.Name .. " " .. sec .. "/" .. totalSec
+        end
+    end
+    return "Mud 1/3"
+end
+
+-- Auto hit every x2 bonus bubble (100% instant hit)
+if Remotes and Remotes:FindFirstChild("TrainBubble") then
+    Remotes.TrainBubble.OnClientEvent:Connect(function(bubbleId)
+        if (Config.AutoTrain or CycleState.CurrentPhase == "Train") and Remotes:FindFirstChild("TrainBubbleHit") then
+            Remotes.TrainBubbleHit:FireServer(bubbleId)
+            CycleState.TotalX2Bonuses = CycleState.TotalX2Bonuses + 1
+        end
+    end)
+end
+
+-- Listen to TrainResult to update real XP / Level stats
+if Remotes and Remotes:FindFirstChild("TrainResult") then
+    Remotes.TrainResult.OnClientEvent:Connect(function(result)
+        if type(result) == "table" then
+            if result.Cur then CycleState.CurXp = result.Cur end
+            if result.Need then CycleState.NeedXp = result.Need end
+            if result.Level then CycleState.Level = result.Level end
+            if result.Xp then CycleState.XpPerRep = result.Xp end
+        end
+    end)
+end
+
+if Remotes and Remotes:FindFirstChild("TrainState") then
+    Remotes.TrainState.OnClientEvent:Connect(function(active, stateTable)
+        if active and type(stateTable) == "table" then
+            if stateTable.Cur then CycleState.CurXp = stateTable.Cur end
+            if stateTable.Need then CycleState.NeedXp = stateTable.Need end
+            if stateTable.Level then CycleState.Level = stateTable.Level end
+        end
+    end)
+end
+
+-- Hook ThrowController to capture last dino pulled
+pcall(function()
+    local ThrowController = require(LocalPlayer:WaitForChild("PlayerScripts"):WaitForChild("Client"):WaitForChild("ThrowController"))
+    local rawFinished = ThrowController.OnFinished
+    ThrowController.OnFinished = function(result)
+        if type(result) == "table" and result.Dino then
+            CycleState.LastDino = tostring(result.Dino)
+        end
+        if rawFinished then
+            return rawFinished(result)
+        end
+    end
+end)
+
+-- Hook AutoPlay & 100% Perfect Throw
 local AutoPlay = require(LocalPlayer:WaitForChild("PlayerScripts"):WaitForChild("Client"):WaitForChild("AutoPlay"))
 local rawOn = AutoPlay.On
 AutoPlay.On = function(mode)
-    if Config.AutoThrow and mode == "Throw" and not isSelling then
+    local isThrowing = (Config.AutoThrow or (Config.AutoTrain and CycleState.CurrentPhase == "Throw"))
+    if isThrowing and mode == "Throw" and not isSelling then
+        return true
+    end
+    if (Config.AutoTrain and CycleState.CurrentPhase == "Train") and mode == "Train" then
         return true
     end
     return rawOn(mode)
@@ -273,19 +366,164 @@ end
 local function updateThrowTiming()
     if Config.PerfectThrow then
         ConfigShared.AutoThrow.Meter = 0.975
-        ConfigShared.AutoThrow.ContinueAfter = 0.5
+        ConfigShared.AutoThrow.ContinueAfter = 0.1
     else
         ConfigShared.AutoThrow.Meter = 0.86
-        ConfigShared.AutoThrow.ContinueAfter = 2.2
+        ConfigShared.AutoThrow.ContinueAfter = 0.5
     end
 end
 updateThrowTiming()
 
--- 12. Auto Throw Worker (Respects isSelling lock)
+-- Auto Skip / Close "Click to continue" & LuckyBoard screen
+task.spawn(function()
+    local VirtualInputManager = game:GetService("VirtualInputManager")
+    while Session.Running do
+        task.wait(0.2)
+        local isThrowing = (Config.AutoThrow or (Config.AutoTrain and CycleState.CurrentPhase == "Throw"))
+        if isThrowing and not isSelling then
+            pcall(function()
+                local pg = LocalPlayer:FindFirstChild("PlayerGui")
+                local hud = pg and pg:FindFirstChild("PAD_HUD")
+                local root = hud and hud:FindFirstChild("Root")
+
+                -- 1. Reveal "Click to continue" screen
+                local throwLayer = root and root:FindFirstChild("ThrowLayer")
+                local reveal = throwLayer and throwLayer:FindFirstChild("Reveal")
+                local cont = reveal and reveal:FindFirstChild("Continue")
+                if cont and cont.Visible then
+                    if VirtualInputManager then
+                        VirtualInputManager:SendMouseButtonEvent(0, 0, 0, true, game, 1)
+                        task.wait(0.04)
+                        VirtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 1)
+                    end
+                end
+
+                -- 2. LuckyBoard popup Continue button
+                local boardLayer = root and root:FindFirstChild("BoardLayer")
+                local luckyBoard = boardLayer and boardLayer:FindFirstChild("LuckyBoard")
+                if luckyBoard and luckyBoard.Visible then
+                    local buttons = luckyBoard:FindFirstChild("Buttons")
+                    local contBtn = buttons and buttons:FindFirstChild("Continue")
+                    if contBtn and contBtn:IsA("GuiButton") and contBtn.Visible then
+                        pcall(function()
+                            local scriptClient = LocalPlayer:FindFirstChild("PlayerScripts") and LocalPlayer.PlayerScripts:FindFirstChild("Client")
+                            local LuckyBoardMod = scriptClient and require(scriptClient:FindFirstChild("LuckyBoard"))
+                            if LuckyBoardMod and LuckyBoardMod.Hide then
+                                LuckyBoardMod.Hide()
+                            end
+                        end)
+                        if VirtualInputManager and contBtn.AbsolutePosition then
+                            local pos = contBtn.AbsolutePosition + (contBtn.AbsoluteSize / 2)
+                            VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 1)
+                            task.wait(0.04)
+                            VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 1)
+                        end
+                    end
+                end
+            end)
+        end
+    end
+end)
+
+-- 12. Alternating Auto Train & Auto Throw Cycle Worker
+task.spawn(function()
+    while Session.Running do
+        task.wait(1)
+        if Config.AutoTrain then
+            local trainDuration = math.max(tonumber(Config.TrainFor) or 60, 5)
+            local throwDuration = tonumber(Config.ThrowFor) or 60
+
+            if throwDuration <= 0 then
+                CycleState.CurrentPhase = "Train"
+                CycleState.TimeRemaining = 0
+
+                local plot = PlotMarker.GetPlot()
+                local trainSpot = plot and plot:FindFirstChild("Training") and plot.Training:FindFirstChild("TrainSpot")
+                local char = LocalPlayer.Character
+                local root = char and char:FindFirstChild("HumanoidRootPart")
+
+                if root and trainSpot and not isSelling then
+                    local dist = (root.Position - trainSpot.Position).Magnitude
+                    if dist > 8 then
+                        root.CFrame = trainSpot.CFrame + Vector3.new(0, 1.5, 0)
+                        task.wait(0.3)
+                    end
+                    Remotes.Train:FireServer("start")
+                end
+            else
+                -- Phase 1: Training Phase
+                CycleState.CurrentPhase = "Train"
+                CycleState.TimeRemaining = trainDuration
+
+                local plot = PlotMarker.GetPlot()
+                local trainSpot = plot and plot:FindFirstChild("Training") and plot.Training:FindFirstChild("TrainSpot")
+                local char = LocalPlayer.Character
+                local root = char and char:FindFirstChild("HumanoidRootPart")
+
+                if root and trainSpot and not isSelling then
+                    root.CFrame = trainSpot.CFrame + Vector3.new(0, 1.5, 0)
+                    task.wait(0.3)
+                    Remotes.Train:FireServer("start")
+                end
+
+                while Session.Running and Config.AutoTrain and CycleState.TimeRemaining > 0 do
+                    task.wait(1)
+                    CycleState.TimeRemaining = CycleState.TimeRemaining - 1
+
+                    if not isSelling and trainSpot and root then
+                        local curDist = (root.Position - trainSpot.Position).Magnitude
+                        if curDist > 6 then
+                            root.CFrame = trainSpot.CFrame + Vector3.new(0, 1.5, 0)
+                            task.wait(0.2)
+                            pcall(function() Remotes.Train:FireServer("start") end)
+                        end
+                    end
+                end
+
+                if not Config.AutoTrain or not Session.Running then break end
+
+                pcall(function() Remotes.Train:FireServer("stop") end)
+                task.wait(0.4)
+
+                -- Phase 2: Throwing Phase
+                CycleState.CurrentPhase = "Throw"
+                CycleState.TimeRemaining = throwDuration
+
+                if ThrowZone and root and not isSelling then
+                    root.CFrame = CFrame.new(ThrowZone.Position.X, ThrowZone.Position.Y + 2.5, ThrowZone.Position.Z)
+                end
+
+                while Session.Running and Config.AutoTrain and CycleState.TimeRemaining > 0 do
+                    task.wait(1)
+                    CycleState.TimeRemaining = CycleState.TimeRemaining - 1
+
+                    if ThrowZone and root and not isSelling then
+                        local dist = (Vector3.new(root.Position.X, 0, root.Position.Z) - Vector3.new(ThrowZone.Position.X, 0, ThrowZone.Position.Z)).Magnitude
+                        if dist > 7 then
+                            root.CFrame = CFrame.new(ThrowZone.Position.X, ThrowZone.Position.Y + 2.5, ThrowZone.Position.Z)
+                        end
+                    end
+                end
+
+                if not Config.AutoTrain or not Session.Running then break end
+            end
+        else
+            if CycleState.CurrentPhase ~= "Idle" then
+                CycleState.CurrentPhase = "Idle"
+                CycleState.TimeRemaining = 0
+                pcall(function() Remotes.Train:FireServer("stop") end)
+            end
+            task.wait(0.5)
+        end
+    end
+end)
+
+-- Standalone Auto Throw Worker
 task.spawn(function()
     while Session.Running do
         task.wait(0.5)
-        if Config.AutoThrow and not isSelling then
+        local isThrowing = Config.AutoThrow or (Config.AutoTrain and CycleState.CurrentPhase == "Throw")
+        if isThrowing and not isSelling then
             local char = LocalPlayer.Character
             local root = char and char:FindFirstChild("HumanoidRootPart")
             local hum = char and char:FindFirstChildOfClass("Humanoid")
@@ -375,7 +613,90 @@ task.spawn(function()
     end
 end)
 
--- 15. Periodic Background Auto Save Loop
+-- 15. Auto Buy Upgrades Worker (Train Station, Harpoons, Trails)
+task.spawn(function()
+    while Session.Running do
+        task.wait(2)
+        if Remotes and not isSelling then
+            local currentMoney = LocalPlayer:GetAttribute("Money") or 0
+
+            -- 1. Auto Buy Train Station
+            if Config.AutoBuyTrain and Remotes:FindFirstChild("BuyStation") then
+                local currentTier = LocalPlayer:GetAttribute("StationTier") or 0
+                local nextStation = ConfigShared.Training and ConfigShared.Training[currentTier + 1]
+                if nextStation and nextStation.Price and currentMoney >= nextStation.Price then
+                    pcall(function()
+                        Remotes.BuyStation:InvokeServer()
+                    end)
+                    task.wait(0.3)
+                    currentMoney = LocalPlayer:GetAttribute("Money") or currentMoney
+                end
+            end
+
+            -- 2. Auto Buy Harpoons (Next tier)
+            if Config.AutoBuyHarpoons and Remotes:FindFirstChild("ShopAction") and ConfigShared.Harpoons then
+                local ownedHarps = {}
+                for id in string.gmatch(LocalPlayer:GetAttribute("OwnedHarpoons") or "", "[^,]+") do
+                    ownedHarps[id] = true
+                end
+
+                for _, harp in ipairs(ConfigShared.Harpoons) do
+                    if not ownedHarps[harp.Id] then
+                        if harp.Price and currentMoney >= harp.Price then
+                            pcall(function()
+                                local res = Remotes.ShopAction:InvokeServer("BuyHarpoon", harp.Id)
+                                if res then
+                                    task.wait(0.15)
+                                    Remotes.ShopAction:InvokeServer("EquipHarpoon", harp.Id)
+                                end
+                            end)
+                            task.wait(0.3)
+                            currentMoney = LocalPlayer:GetAttribute("Money") or currentMoney
+                        end
+                        break -- Only target next unowned tier
+                    end
+                end
+            end
+
+            -- 3. Auto Buy Trails (Next free tier)
+            if Config.AutoBuyTrails and Remotes:FindFirstChild("ShopAction") then
+                local TrailsMod = nil
+                pcall(function()
+                    TrailsMod = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Trails"))
+                end)
+
+                if TrailsMod then
+                    local trailList = TrailsMod.List or TrailsMod
+                    local ownedTrs = {}
+                    for id in string.gmatch(LocalPlayer:GetAttribute("OwnedTrails") or "", "[^,]+") do
+                        ownedTrs[id] = true
+                    end
+
+                    for _, tr in ipairs(trailList) do
+                        if type(tr) == "table" and tr.Id and (tr.Tier == "Free" or tr.Tier == nil) then
+                            if not ownedTrs[tr.Id] then
+                                if tr.Price and currentMoney >= tr.Price then
+                                    pcall(function()
+                                        local res = Remotes.ShopAction:InvokeServer("BuyTrail", tr.Id)
+                                        if res then
+                                            task.wait(0.15)
+                                            Remotes.ShopAction:InvokeServer("EquipTrail", tr.Id)
+                                        end
+                                    end)
+                                    task.wait(0.3)
+                                    currentMoney = LocalPlayer:GetAttribute("Money") or currentMoney
+                                end
+                                break -- Target next unowned trail
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+end)
+
+-- 16. Periodic Background Auto Save Loop
 task.spawn(function()
     while Session.Running do
         task.wait(10)
@@ -388,15 +709,388 @@ local Window = Fluent:CreateWindow({
     Title = "Pull a Dino 🦖",
     SubTitle = "ALAN",
     TabWidth = 140,
-    Size = UDim2.fromOffset(560, 460),
+    Size = UDim2.fromOffset(560, 480),
     Acrylic = false,
     Theme = "Dark",
     MinimizeKey = Enum.KeyCode.RightControl
 })
 
 local Tabs = {
-    Main = Window:AddTab({ Title = "Main", Icon = "gamepad-2" })
+    Main = Window:AddTab({ Title = "Main", Icon = "gamepad-2" }),
+    Upgrades = Window:AddTab({ Title = "Upgrades", Icon = "shopping-cart" })
 }
+
+-- 17. Custom Stylized Training Card Widget (Exactly as in reference)
+local function BuildTrainingWidget(parent)
+    local card = Instance.new("Frame")
+    card.Name = "TrainingWidgetCard"
+    card.Size = UDim2.new(1, 0, 0, 286)
+    card.BackgroundColor3 = Color3.fromRGB(120, 120, 120)
+    card.BackgroundTransparency = 0.87
+    card.BorderSizePixel = 0
+    card.LayoutOrder = -10
+    card.Parent = parent
+
+    local cardCorner = Instance.new("UICorner", card)
+    cardCorner.CornerRadius = UDim.new(0, 4)
+
+    local cardStroke = Instance.new("UIStroke", card)
+    cardStroke.Color = Color3.fromRGB(35, 35, 35)
+    cardStroke.Transparency = 0.5
+    cardStroke.Thickness = 1
+    cardStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+
+    local padding = Instance.new("UIPadding", card)
+    padding.PaddingTop = UDim.new(0, 10)
+    padding.PaddingBottom = UDim.new(0, 10)
+    padding.PaddingLeft = UDim.new(0, 12)
+    padding.PaddingRight = UDim.new(0, 12)
+
+    -- Header: ⚡ Training (Left) & Status Badge (Right)
+    local headerFrame = Instance.new("Frame", card)
+    headerFrame.Size = UDim2.new(1, 0, 0, 22)
+    headerFrame.BackgroundTransparency = 1
+
+    local title = Instance.new("TextLabel", headerFrame)
+    title.Size = UDim2.new(0.55, 0, 1, 0)
+    title.BackgroundTransparency = 1
+    title.Text = "⚡ Training"
+    title.TextColor3 = Color3.fromRGB(240, 240, 245)
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 13.5
+    title.TextXAlignment = Enum.TextXAlignment.Left
+
+    local statusBadge = Instance.new("Frame", headerFrame)
+    statusBadge.Size = UDim2.fromOffset(118, 20)
+    statusBadge.Position = UDim2.new(1, 0, 0.5, 0)
+    statusBadge.AnchorPoint = Vector2.new(1, 0.5)
+    statusBadge.BackgroundColor3 = Color3.fromRGB(48, 22, 12)
+    Instance.new("UICorner", statusBadge).CornerRadius = UDim.new(0, 10)
+    local badgeStroke = Instance.new("UIStroke", statusBadge)
+    badgeStroke.Color = Color3.fromRGB(150, 65, 25)
+    badgeStroke.Thickness = 1
+
+    local statusLabel = Instance.new("TextLabel", statusBadge)
+    statusLabel.Size = UDim2.fromScale(1, 1)
+    statusLabel.BackgroundTransparency = 1
+    statusLabel.Text = "● paused: throw"
+    statusLabel.TextColor3 = Color3.fromRGB(255, 125, 45)
+    statusLabel.Font = Enum.Font.GothamBold
+    statusLabel.TextSize = 10.5
+
+    -- Auto Train Row
+    local toggleRow = Instance.new("Frame", card)
+    toggleRow.Size = UDim2.new(1, 0, 0, 22)
+    toggleRow.Position = UDim2.new(0, 0, 0, 26)
+    toggleRow.BackgroundTransparency = 1
+
+    local checkbox = Instance.new("TextButton", toggleRow)
+    checkbox.Size = UDim2.fromOffset(18, 18)
+    checkbox.Position = UDim2.new(0, 0, 0.5, 0)
+    checkbox.AnchorPoint = Vector2.new(0, 0.5)
+    checkbox.BackgroundColor3 = Config.AutoTrain and Color3.fromRGB(255, 110, 25) or Color3.fromRGB(36, 34, 42)
+    checkbox.Text = Config.AutoTrain and "✓" or ""
+    checkbox.TextColor3 = Color3.fromRGB(255, 255, 255)
+    checkbox.Font = Enum.Font.GothamBold
+    checkbox.TextSize = 12
+    checkbox.AutoButtonColor = false
+    Instance.new("UICorner", checkbox).CornerRadius = UDim.new(0, 4)
+    local cbStroke = Instance.new("UIStroke", checkbox)
+    cbStroke.Color = Color3.fromRGB(160, 75, 25)
+    cbStroke.Thickness = 1
+
+    local toggleLabel = Instance.new("TextLabel", toggleRow)
+    toggleLabel.Size = UDim2.new(1, -26, 1, 0)
+    toggleLabel.Position = UDim2.new(0, 26, 0, 0)
+    toggleLabel.BackgroundTransparency = 1
+    toggleLabel.Text = "Auto Train"
+    toggleLabel.TextColor3 = Color3.fromRGB(235, 235, 240)
+    toggleLabel.Font = Enum.Font.GothamMedium
+    toggleLabel.TextSize = 13
+    toggleLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+    checkbox.MouseButton1Click:Connect(function()
+        Config.AutoTrain = not Config.AutoTrain
+        checkbox.BackgroundColor3 = Config.AutoTrain and Color3.fromRGB(255, 110, 25) or Color3.fromRGB(36, 34, 42)
+        checkbox.Text = Config.AutoTrain and "✓" or ""
+        if not Config.AutoTrain then
+            pcall(function() Remotes.Train:FireServer("stop") end)
+            CycleState.CurrentPhase = "Idle"
+            CycleState.TimeRemaining = 0
+        end
+        saveConfig()
+    end)
+
+    -- Custom Slider Creator
+    local function createCustomSlider(titleText, defaultVal, posOffsetY, minVal, maxVal, onValChange)
+        local sliderFrame = Instance.new("Frame", card)
+        sliderFrame.Size = UDim2.new(1, 0, 0, 26)
+        sliderFrame.Position = UDim2.new(0, 0, 0, posOffsetY)
+        sliderFrame.BackgroundTransparency = 1
+
+        local labelLeft = Instance.new("TextLabel", sliderFrame)
+        labelLeft.Size = UDim2.new(0.5, 0, 0, 13)
+        labelLeft.BackgroundTransparency = 1
+        labelLeft.Text = titleText
+        labelLeft.TextColor3 = Color3.fromRGB(190, 190, 195)
+        labelLeft.Font = Enum.Font.GothamMedium
+        labelLeft.TextSize = 11.5
+        labelLeft.TextXAlignment = Enum.TextXAlignment.Left
+
+        local labelRight = Instance.new("TextLabel", sliderFrame)
+        labelRight.Size = UDim2.new(0.5, 0, 0, 13)
+        labelRight.Position = UDim2.new(0.5, 0, 0, 0)
+        labelRight.BackgroundTransparency = 1
+        labelRight.Text = tostring(defaultVal) .. " s"
+        labelRight.TextColor3 = Color3.fromRGB(255, 255, 255)
+        labelRight.Font = Enum.Font.GothamBold
+        labelRight.TextSize = 11.5
+        labelRight.TextXAlignment = Enum.TextXAlignment.Right
+
+        local track = Instance.new("Frame", sliderFrame)
+        track.Size = UDim2.new(1, 0, 0, 5)
+        track.Position = UDim2.new(0, 0, 0, 17)
+        track.BackgroundColor3 = Color3.fromRGB(42, 40, 48)
+        track.BorderSizePixel = 0
+        Instance.new("UICorner", track).CornerRadius = UDim.new(0, 3)
+
+        local initialPct = math.clamp((defaultVal - minVal) / (maxVal - minVal), 0, 1)
+
+        local fill = Instance.new("Frame", track)
+        fill.Size = UDim2.new(initialPct, 0, 1, 0)
+        fill.BackgroundColor3 = Color3.fromRGB(255, 120, 35)
+        fill.BorderSizePixel = 0
+        Instance.new("UICorner", fill).CornerRadius = UDim.new(0, 3)
+
+        local knob = Instance.new("Frame", track)
+        knob.Size = UDim2.fromOffset(13, 13)
+        knob.Position = UDim2.new(initialPct, 0, 0.5, 0)
+        knob.AnchorPoint = Vector2.new(0.5, 0.5)
+        knob.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+        knob.BorderSizePixel = 0
+        Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
+
+        local dragging = false
+        local function update(input)
+            local pct = math.clamp((input.Position.X - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
+            local val = math.floor(minVal + pct * (maxVal - minVal) + 0.5)
+            fill.Size = UDim2.new(pct, 0, 1, 0)
+            knob.Position = UDim2.new(pct, 0, 0.5, 0)
+            labelRight.Text = tostring(val) .. " s"
+            onValChange(val)
+        end
+
+        track.InputBegan:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                dragging = true
+                update(input)
+            end
+        end)
+
+        UserInputService.InputChanged:Connect(function(input)
+            if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+                update(input)
+            end
+        end)
+
+        UserInputService.InputEnded:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                dragging = false
+            end
+        end)
+    end
+
+    -- Train For Slider
+    createCustomSlider("Train For", Config.TrainFor or 60, 52, 10, 300, function(val)
+        Config.TrainFor = val
+        saveConfig()
+    end)
+
+    -- Level & XP Progress Section
+    local xpRow = Instance.new("Frame", card)
+    xpRow.Size = UDim2.new(1, 0, 0, 13)
+    xpRow.Position = UDim2.new(0, 0, 0, 84)
+    xpRow.BackgroundTransparency = 1
+
+    local levelLabel = Instance.new("TextLabel", xpRow)
+    levelLabel.Size = UDim2.new(0.5, 0, 1, 0)
+    levelLabel.BackgroundTransparency = 1
+    levelLabel.Text = "Level 185"
+    levelLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    levelLabel.Font = Enum.Font.GothamBold
+    levelLabel.TextSize = 12.5
+    levelLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+    local xpRatioLabel = Instance.new("TextLabel", xpRow)
+    xpRatioLabel.Size = UDim2.new(0.5, 0, 1, 0)
+    xpRatioLabel.Position = UDim2.new(0.5, 0, 0, 0)
+    xpRatioLabel.BackgroundTransparency = 1
+    xpRatioLabel.Text = "19.5K / 32.47K"
+    xpRatioLabel.TextColor3 = Color3.fromRGB(160, 160, 170)
+    xpRatioLabel.Font = Enum.Font.GothamMedium
+    xpRatioLabel.TextSize = 11.5
+    xpRatioLabel.TextXAlignment = Enum.TextXAlignment.Right
+
+    -- Progress Bar
+    local barTrack = Instance.new("Frame", card)
+    barTrack.Size = UDim2.new(1, 0, 0, 7)
+    barTrack.Position = UDim2.new(0, 0, 0, 101)
+    barTrack.BackgroundColor3 = Color3.fromRGB(42, 40, 48)
+    barTrack.BorderSizePixel = 0
+    Instance.new("UICorner", barTrack).CornerRadius = UDim.new(0, 4)
+
+    local barFill = Instance.new("Frame", barTrack)
+    barFill.Size = UDim2.new(0.6, 0, 1, 0)
+    barFill.BackgroundColor3 = Color3.fromRGB(255, 120, 35)
+    barFill.BorderSizePixel = 0
+    Instance.new("UICorner", barFill).CornerRadius = UDim.new(0, 4)
+
+    -- Training Sub-detail Labels
+    local detailBarLabel = Instance.new("TextLabel", card)
+    detailBarLabel.Size = UDim2.new(1, 0, 0, 13)
+    detailBarLabel.Position = UDim2.new(0, 0, 0, 113)
+    detailBarLabel.BackgroundTransparency = 1
+    detailBarLabel.Text = "Lime Neon Bar, 2.05K XP a rep"
+    detailBarLabel.TextColor3 = Color3.fromRGB(145, 145, 155)
+    detailBarLabel.Font = Enum.Font.Gotham
+    detailBarLabel.TextSize = 10.5
+    detailBarLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+    local detailReachLabel = Instance.new("TextLabel", card)
+    detailReachLabel.Size = UDim2.new(1, 0, 0, 13)
+    detailReachLabel.Position = UDim2.new(0, 0, 0, 127)
+    detailReachLabel.BackgroundTransparency = 1
+    detailReachLabel.Text = "Level 188 reaches 973 studs"
+    detailReachLabel.TextColor3 = Color3.fromRGB(145, 145, 155)
+    detailReachLabel.Font = Enum.Font.Gotham
+    detailReachLabel.TextSize = 10.5
+    detailReachLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+    local detailX2Label = Instance.new("TextLabel", card)
+    detailX2Label.Size = UDim2.new(1, 0, 0, 13)
+    detailX2Label.Position = UDim2.new(0, 0, 0, 141)
+    detailX2Label.BackgroundTransparency = 1
+    detailX2Label.Text = "79 x2 bonuses"
+    detailX2Label.TextColor3 = Color3.fromRGB(145, 145, 155)
+    detailX2Label.Font = Enum.Font.Gotham
+    detailX2Label.TextSize = 10.5
+    detailX2Label.TextXAlignment = Enum.TextXAlignment.Left
+
+    -- Throw For Slider
+    createCustomSlider("Throw For", Config.ThrowFor or 60, 160, 0, 300, function(val)
+        Config.ThrowFor = val
+        saveConfig()
+    end)
+
+    -- Throw Sub-details
+    local throwReachLabel = Instance.new("TextLabel", card)
+    throwReachLabel.Size = UDim2.new(1, 0, 0, 13)
+    throwReachLabel.Position = UDim2.new(0, 0, 0, 192)
+    throwReachLabel.BackgroundTransparency = 1
+    throwReachLabel.Text = "Reach 958 studs, Mountains 2/3"
+    throwReachLabel.TextColor3 = Color3.fromRGB(145, 145, 155)
+    throwReachLabel.Font = Enum.Font.Gotham
+    throwReachLabel.TextSize = 10.5
+    throwReachLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+    local foodLabel = Instance.new("TextLabel", card)
+    foodLabel.Size = UDim2.new(1, 0, 0, 13)
+    foodLabel.Position = UDim2.new(0, 0, 0, 206)
+    foodLabel.BackgroundTransparency = 1
+    foodLabel.Text = "Food: Bacon"
+    foodLabel.TextColor3 = Color3.fromRGB(145, 145, 155)
+    foodLabel.Font = Enum.Font.Gotham
+    foodLabel.TextSize = 10.5
+    foodLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+    local lastDinoLabel = Instance.new("TextLabel", card)
+    lastDinoLabel.Size = UDim2.new(1, 0, 0, 13)
+    lastDinoLabel.Position = UDim2.new(0, 0, 0, 220)
+    lastDinoLabel.BackgroundTransparency = 1
+    lastDinoLabel.Text = "Last: Bull"
+    lastDinoLabel.TextColor3 = Color3.fromRGB(145, 145, 155)
+    lastDinoLabel.Font = Enum.Font.Gotham
+    lastDinoLabel.TextSize = 10.5
+    lastDinoLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+    local countdownLabel = Instance.new("TextLabel", card)
+    countdownLabel.Size = UDim2.new(1, 0, 0, 14)
+    countdownLabel.Position = UDim2.new(0, 0, 0, 235)
+    countdownLabel.BackgroundTransparency = 1
+    countdownLabel.Text = "Training in 0:31"
+    countdownLabel.TextColor3 = Color3.fromRGB(255, 130, 45)
+    countdownLabel.Font = Enum.Font.GothamBold
+    countdownLabel.TextSize = 11
+    countdownLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+    -- Live UI Refresh Loop
+    task.spawn(function()
+        while Session.Running and card.Parent do
+            task.wait(0.3)
+            pcall(function()
+                if CycleState.CurrentPhase == "Train" then
+                    statusLabel.Text = "● training"
+                    statusBadge.BackgroundColor3 = Color3.fromRGB(20, 48, 20)
+                    badgeStroke.Color = Color3.fromRGB(35, 140, 45)
+                    statusLabel.TextColor3 = Color3.fromRGB(60, 225, 80)
+                elseif CycleState.CurrentPhase == "Throw" then
+                    statusLabel.Text = "● paused: throw"
+                    statusBadge.BackgroundColor3 = Color3.fromRGB(48, 22, 12)
+                    badgeStroke.Color = Color3.fromRGB(150, 65, 25)
+                    statusLabel.TextColor3 = Color3.fromRGB(255, 125, 45)
+                else
+                    statusLabel.Text = "● idle"
+                    statusBadge.BackgroundColor3 = Color3.fromRGB(32, 30, 38)
+                    badgeStroke.Color = Color3.fromRGB(65, 62, 75)
+                    statusLabel.TextColor3 = Color3.fromRGB(155, 155, 165)
+                end
+
+                local trainLvl = LocalPlayer:GetAttribute("TrainLevel") or CycleState.Level or 1
+                local stationTier = LocalPlayer:GetAttribute("StationTier") or 1
+                local station = ConfigShared.Training[stationTier]
+                local stationName = station and station.Name or "Bar"
+                local stationXp = station and station.Xp or 1
+                local curXp = CycleState.CurXp or 0
+                local needXp = ConfigShared.XpNeeded and ConfigShared.XpNeeded(trainLvl) or CycleState.NeedXp or 100
+                if needXp <= 0 then needXp = 100 end
+
+                local ratio = math.clamp(curXp / needXp, 0, 1)
+                barFill.Size = UDim2.new(ratio, 0, 1, 0)
+
+                levelLabel.Text = "Level " .. tostring(trainLvl)
+                xpRatioLabel.Text = NumberFormat.short(curXp) .. " / " .. NumberFormat.short(needXp)
+
+                detailBarLabel.Text = stationName .. ", " .. NumberFormat.short(stationXp) .. " XP a rep"
+
+                local nextTargetLvl = trainLvl + 3
+                local nextStuds = math.floor(nextTargetLvl * (station and station.PowerMult or 1) * 6 / 2)
+                detailReachLabel.Text = "Level " .. tostring(nextTargetLvl) .. " reaches " .. tostring(nextStuds) .. " studs"
+
+                detailX2Label.Text = tostring(CycleState.TotalX2Bonuses) .. " x2 bonuses"
+
+                local power = LocalPlayer:GetAttribute("ThrowPower") or 0
+                local reachStuds = math.floor(power * 6 / 20)
+                local zoneText = getZoneInfo(reachStuds)
+                throwReachLabel.Text = "Reach " .. tostring(reachStuds) .. " studs, " .. zoneText
+
+                foodLabel.Text = "Food: " .. tostring(LocalPlayer:GetAttribute("Trail") or "Bacon")
+                lastDinoLabel.Text = "Last: " .. tostring(CycleState.LastDino or "None")
+
+                if CycleState.CurrentPhase == "Throw" then
+                    local rem = math.max(CycleState.TimeRemaining or 0, 0)
+                    countdownLabel.Text = ("Training in %d:%02d"):format(math.floor(rem / 60), rem % 60)
+                elseif CycleState.CurrentPhase == "Train" then
+                    local rem = math.max(CycleState.TimeRemaining or 0, 0)
+                    countdownLabel.Text = ("Throwing in %d:%02d"):format(math.floor(rem / 60), rem % 60)
+                else
+                    countdownLabel.Text = "Cycle Idle"
+                end
+            end)
+        end
+    end)
+end
+
+BuildTrainingWidget(Tabs.Main.Container or Tabs.Main.ScrollFrame or Tabs.Main.Frame)
 
 -- Farming Section
 Tabs.Main:AddSection("Farming")
@@ -463,6 +1157,36 @@ local InputMaxSell = Tabs.Main:AddInput("InputMaxSell", {
 })
 InputMaxSell:OnChanged(function()
     Config.MaxSellIncome = Fluent.Options.InputMaxSell.Value
+    saveConfig()
+end)
+
+-- Upgrades Section (New Category)
+Tabs.Upgrades:AddSection("Auto Buy & Upgrades")
+
+local ToggleAutoTrainBuy = Tabs.Upgrades:AddToggle("ToggleAutoBuyTrain", {
+    Title = "Auto Buy Train",
+    Default = Config.AutoBuyTrain
+})
+ToggleAutoTrainBuy:OnChanged(function()
+    Config.AutoBuyTrain = Fluent.Options.ToggleAutoBuyTrain.Value
+    saveConfig()
+end)
+
+local ToggleAutoHarpoonsBuy = Tabs.Upgrades:AddToggle("ToggleAutoBuyHarpoons", {
+    Title = "Auto Buy Harpoons",
+    Default = Config.AutoBuyHarpoons
+})
+ToggleAutoHarpoonsBuy:OnChanged(function()
+    Config.AutoBuyHarpoons = Fluent.Options.ToggleAutoBuyHarpoons.Value
+    saveConfig()
+end)
+
+local ToggleAutoTrailsBuy = Tabs.Upgrades:AddToggle("ToggleAutoBuyTrails", {
+    Title = "Auto Buy Trails",
+    Default = Config.AutoBuyTrails
+})
+ToggleAutoTrailsBuy:OnChanged(function()
+    Config.AutoBuyTrails = Fluent.Options.ToggleAutoBuyTrails.Value
     saveConfig()
 end)
 
