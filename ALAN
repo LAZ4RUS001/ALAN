@@ -1,0 +1,588 @@
+-- 1. Ensure game and LocalPlayer are fully loaded (Crucial for Delta Mobile & auto-execute)
+if not game:IsLoaded() then
+    pcall(function() game.Loaded:Wait() end)
+end
+
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+while not LocalPlayer do
+    task.wait(0.2)
+    LocalPlayer = Players.LocalPlayer
+end
+
+-- 2. Safe GUI Parent Resolver (Prioritizes gethui for Delta Mobile, fallback to CoreGui/PlayerGui)
+local function GetSafeGuiParent()
+    local ok, res = pcall(function()
+        if gethui then
+            return gethui()
+        end
+        return game:GetService("CoreGui")
+    end)
+    if ok and res then return res end
+    return LocalPlayer:WaitForChild("PlayerGui")
+end
+
+-- 3. Clean previous GUI instances to prevent duplicate UI overlays
+pcall(function()
+    local containers = {}
+    pcall(function() if gethui then table.insert(containers, gethui()) end end)
+    pcall(function() table.insert(containers, game:GetService("CoreGui")) end)
+    pcall(function() table.insert(containers, LocalPlayer:FindFirstChild("PlayerGui")) end)
+
+    for _, container in ipairs(containers) do
+        if container then
+            for _, g in ipairs(container:GetChildren()) do
+                if g:IsA("ScreenGui") then
+                    if g.Name == "StreetHubPullADino" or g.Name == "StreetHubMobileToggle" or g.Name == "Fluent" then
+                        pcall(function() g:Destroy() end)
+                    end
+                end
+            end
+        end
+    end
+end)
+
+-- Clean any leftover DepthOfField / blur effects created by Fluent Acrylic
+pcall(function()
+    local lighting = game:GetService("Lighting")
+    for _, child in ipairs(lighting:GetChildren()) do
+        if child:IsA("DepthOfFieldEffect") and child.Name:find("Fluent") then
+            child:Destroy()
+        end
+    end
+end)
+
+-- 4. Session Manager (Terminates previous running threads)
+if _G.PullADinoSession then
+    pcall(function()
+        _G.PullADinoSession.Running = false
+    end)
+    task.wait(0.15)
+end
+local Session = { Running = true }
+_G.PullADinoSession = Session
+
+-- 5. Safe Services
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local HttpService = game:GetService("HttpService")
+local VirtualUser = game:GetService("VirtualUser")
+
+local Remotes = ReplicatedStorage:WaitForChild("Remotes", 30)
+local Map = workspace:WaitForChild("Map", 30)
+local ThrowZone = Map and Map:WaitForChild("ThrowArea"):WaitForChild("Platform"):WaitForChild("ThrowZone")
+local SellZone = Map and Map:WaitForChild("Market"):WaitForChild("SellStand"):WaitForChild("Zone")
+
+local ConfigShared = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Config"))
+local Inventory = require(LocalPlayer:WaitForChild("PlayerScripts"):WaitForChild("Client"):WaitForChild("Inventory"))
+
+-- 6. Resilient Script Fetcher (Handles 302 redirects & HTTP drops on Mobile Executors)
+local httpRequest = (syn and syn.request) or (http and http.request) or http_request or request
+
+local function FetchScript(url, maxRetries)
+    maxRetries = maxRetries or 3
+    for attempt = 1, maxRetries do
+        if httpRequest then
+            local reqOk, res = pcall(function()
+                return httpRequest({
+                    Url = url,
+                    Method = "GET"
+                })
+            end)
+            if reqOk and res and res.Body and #res.Body > 50 then
+                return res.Body
+            end
+        end
+        local ok, result = pcall(function()
+            return game:HttpGet(url, true)
+        end)
+        if ok and result and #result > 50 then
+            return result
+        end
+        task.wait(0.4)
+    end
+    return nil
+end
+
+-- 7. Load Fluent UI safely (Compatible with PC & Mobile Executors)
+local Fluent = nil
+local okFluent, resFluent = pcall(function()
+    return loadstring(game:HttpGet("https://github.com/dawid-scripts/Fluent/releases/latest/download/main.lua"))()
+end)
+if okFluent and resFluent then
+    Fluent = resFluent
+else
+    local fallbackSource = FetchScript("https://raw.githubusercontent.com/dawid-scripts/Fluent/master/releases/latest/download/main.lua")
+    if fallbackSource then
+        Fluent = loadstring(fallbackSource)()
+    end
+end
+
+if not Fluent then
+    warn("[ALAN] Failed to load Fluent UI library.")
+    return
+end
+
+-- 8. State Configuration
+local Config = {
+    AutoThrow = false,
+    PerfectThrow = true,
+    AutoSell = false,
+    MaxSellIncome = "All",
+    EquipBest = false,
+    AutoGifts = false,
+    AntiAFK = true
+}
+
+local isSelling = false
+
+-- 9. Per-Account Background Save & Load System (Works on all executors with file API fallback)
+local FOLDER_NAME = "PullADinoHub"
+local CONFIG_FILE = FOLDER_NAME .. "/" .. tostring(LocalPlayer.UserId) .. ".json"
+
+local function hasFileSystem()
+    return (type(writefile) == "function" or type(write_file) == "function")
+        and (type(readfile) == "function" or type(read_file) == "function")
+end
+
+local function safeWriteFile(path, content)
+    local write = writefile or write_file
+    if write then
+        pcall(function() write(path, content) end)
+    end
+end
+
+local function safeReadFile(path)
+    local read = readfile or read_file
+    if read then
+        local ok, res = pcall(function() return read(path) end)
+        if ok and res then return res end
+    end
+    return nil
+end
+
+local function safeMakeFolder(folder)
+    local mkdir = makefolder or make_folder
+    local isdir = isfolder or is_folder
+    if mkdir then
+        pcall(function()
+            if isdir and not isdir(folder) then
+                mkdir(folder)
+            elseif not isdir then
+                mkdir(folder)
+            end
+        end)
+    end
+end
+
+local function safeIsFile(path)
+    local check = isfile or is_file
+    if check then
+        local ok, res = pcall(function() return check(path) end)
+        if ok then return res end
+    end
+    return false
+end
+
+local function saveConfig()
+    if not hasFileSystem() then return end
+    pcall(function()
+        safeMakeFolder(FOLDER_NAME)
+        local data = {
+            AutoThrow = Config.AutoThrow,
+            PerfectThrow = Config.PerfectThrow,
+            AutoSell = Config.AutoSell,
+            MaxSellIncome = Config.MaxSellIncome,
+            EquipBest = Config.EquipBest,
+            AutoGifts = Config.AutoGifts,
+            AntiAFK = Config.AntiAFK
+        }
+        safeWriteFile(CONFIG_FILE, HttpService:JSONEncode(data))
+    end)
+end
+
+local function loadConfig()
+    if not hasFileSystem() then return end
+    pcall(function()
+        if safeIsFile(CONFIG_FILE) then
+            local raw = safeReadFile(CONFIG_FILE)
+            if raw then
+                local decoded = HttpService:JSONDecode(raw)
+                if type(decoded) == "table" then
+                    for key, val in pairs(decoded) do
+                        Config[key] = val
+                    end
+                    if decoded.MaxSellPrice and not decoded.MaxSellIncome then
+                        Config.MaxSellIncome = decoded.MaxSellPrice
+                    end
+                end
+            end
+        end
+    end)
+end
+
+loadConfig()
+
+-- Income String Parser ($/s parser supporting 100k, 5M, 1B, with or without /s)
+local function parseIncome(str)
+    if type(str) == "number" then return str end
+    if type(str) ~= "string" or str == "" then return 0 end
+    local lower = string.lower(str)
+    if lower == "all" or lower == "max" or lower == "inf" then
+        return math.huge
+    end
+    str = string.gsub(str, "[,%$%s/sS]", "")
+    local num, suffix = string.match(str, "^([%d%.]+)%s*([kKmMbBtT]?)$")
+    if not num then return tonumber(str) or 0 end
+    num = tonumber(num) or 0
+    suffix = string.lower(suffix or "")
+    if suffix == "k" then
+        return num * 1e3
+    elseif suffix == "m" then
+        return num * 1e6
+    elseif suffix == "b" then
+        return num * 1e9
+    elseif suffix == "t" then
+        return num * 1e12
+    end
+    return num
+end
+
+-- 10. Anti AFK (PC & Mobile Safe)
+LocalPlayer.Idled:Connect(function()
+    if Config.AntiAFK and Session.Running then
+        pcall(function()
+            VirtualUser:CaptureController()
+            VirtualUser:ClickButton2(Vector2.new(0, 0))
+        end)
+    end
+end)
+
+-- 11. Hook AutoPlay & 100% Perfect Throw
+local AutoPlay = require(LocalPlayer:WaitForChild("PlayerScripts"):WaitForChild("Client"):WaitForChild("AutoPlay"))
+local rawOn = AutoPlay.On
+AutoPlay.On = function(mode)
+    if Config.AutoThrow and mode == "Throw" and not isSelling then
+        return true
+    end
+    return rawOn(mode)
+end
+
+local function updateThrowTiming()
+    if Config.PerfectThrow then
+        ConfigShared.AutoThrow.Meter = 0.975
+        ConfigShared.AutoThrow.ContinueAfter = 0.5
+    else
+        ConfigShared.AutoThrow.Meter = 0.86
+        ConfigShared.AutoThrow.ContinueAfter = 2.2
+    end
+end
+updateThrowTiming()
+
+-- 12. Auto Throw Worker (Respects isSelling lock)
+task.spawn(function()
+    while Session.Running do
+        task.wait(0.5)
+        if Config.AutoThrow and not isSelling then
+            local char = LocalPlayer.Character
+            local root = char and char:FindFirstChild("HumanoidRootPart")
+            local hum = char and char:FindFirstChildOfClass("Humanoid")
+            if root and hum and hum.Health > 0 and ThrowZone then
+                local dist = (Vector3.new(root.Position.X, 0, root.Position.Z) - Vector3.new(ThrowZone.Position.X, 0, ThrowZone.Position.Z)).Magnitude
+                if dist > 7 then
+                    root.CFrame = CFrame.new(ThrowZone.Position.X, ThrowZone.Position.Y + 2.5, ThrowZone.Position.Z)
+                end
+            end
+        end
+    end
+end)
+
+-- 13. Auto Sell & Equip Best Worker (With Sell Protection Lock)
+task.spawn(function()
+    while Session.Running do
+        task.wait(3)
+        if Config.EquipBest and Remotes then
+            pcall(function()
+                Remotes.DinoAction:InvokeServer("EquipBest")
+            end)
+        end
+
+        if Config.AutoSell and not isSelling and Remotes and SellZone then
+            local maxIncome = parseIncome(Config.MaxSellIncome)
+            local char = LocalPlayer.Character
+            local root = char and char:FindFirstChild("HumanoidRootPart")
+
+            if root and Inventory and Inventory.Dinos then
+                local toSell = {}
+                local bestDinoIncome = LocalPlayer:GetAttribute("BestDinoIncome") or 0
+                local totalBackpack = 0
+
+                for id, dino in pairs(Inventory.Dinos) do
+                    if (dino.Slot or 0) == 0 then
+                        totalBackpack = totalBackpack + 1
+                        local dinoIncome = ConfigShared.IncomeOf(dino, bestDinoIncome) or 0
+                        if maxIncome == math.huge or maxIncome <= 0 or dinoIncome <= maxIncome then
+                            table.insert(toSell, dino.Id or id)
+                        end
+                    end
+                end
+
+                if #toSell > 0 then
+                    isSelling = true
+                    local savedCF = root.CFrame
+
+                    root.CFrame = CFrame.new(SellZone.Position.X, SellZone.Position.Y + 3, SellZone.Position.Z)
+                    task.wait(0.3)
+
+                    if maxIncome == math.huge or #toSell == totalBackpack then
+                        pcall(function()
+                            Remotes.DinoAction:InvokeServer("SellAll")
+                        end)
+                        task.wait(0.2)
+                    else
+                        for _, dinoId in ipairs(toSell) do
+                            pcall(function()
+                                Remotes.DinoAction:InvokeServer("Sell", dinoId)
+                            end)
+                            task.wait(0.1)
+                        end
+                        task.wait(0.15)
+                    end
+
+                    root.CFrame = savedCF
+                    task.wait(0.2)
+                    isSelling = false
+                end
+            end
+        end
+    end
+end)
+
+-- 14. Auto Free Gifts Worker
+task.spawn(function()
+    while Session.Running do
+        if Config.AutoGifts and Remotes then
+            for giftIndex = 1, 12 do
+                pcall(function()
+                    Remotes.ClaimGift:InvokeServer(giftIndex)
+                end)
+                task.wait(0.15)
+            end
+        end
+        task.wait(15)
+    end
+end)
+
+-- 15. Periodic Background Auto Save Loop
+task.spawn(function()
+    while Session.Running do
+        task.wait(10)
+        saveConfig()
+    end
+end)
+
+-- 16. Fluent UI Setup
+local Window = Fluent:CreateWindow({
+    Title = "Pull a Dino 🦖",
+    SubTitle = "ALAN",
+    TabWidth = 140,
+    Size = UDim2.fromOffset(560, 460),
+    Acrylic = false,
+    Theme = "Dark",
+    MinimizeKey = Enum.KeyCode.RightControl
+})
+
+local Tabs = {
+    Main = Window:AddTab({ Title = "Main", Icon = "gamepad-2" })
+}
+
+-- Farming Section
+Tabs.Main:AddSection("Farming")
+
+local ToggleAutoThrow = Tabs.Main:AddToggle("ToggleAutoThrow", {
+    Title = "Auto Throw",
+    Default = Config.AutoThrow
+})
+ToggleAutoThrow:OnChanged(function()
+    Config.AutoThrow = Fluent.Options.ToggleAutoThrow.Value
+    saveConfig()
+end)
+
+local TogglePerfectThrow = Tabs.Main:AddToggle("TogglePerfectThrow", {
+    Title = "Always Perfect Throw (100%)",
+    Default = Config.PerfectThrow
+})
+TogglePerfectThrow:OnChanged(function()
+    Config.PerfectThrow = Fluent.Options.TogglePerfectThrow.Value
+    updateThrowTiming()
+    saveConfig()
+end)
+
+local ToggleAutoGifts = Tabs.Main:AddToggle("ToggleAutoGifts", {
+    Title = "Auto Free Gifts",
+    Default = Config.AutoGifts
+})
+ToggleAutoGifts:OnChanged(function()
+    Config.AutoGifts = Fluent.Options.ToggleAutoGifts.Value
+    saveConfig()
+end)
+
+-- Pet Section
+Tabs.Main:AddSection("Pet Management")
+
+local ToggleEquipBest = Tabs.Main:AddToggle("ToggleEquipBest", {
+    Title = "Equip Best Pet",
+    Default = Config.EquipBest
+})
+ToggleEquipBest:OnChanged(function()
+    Config.EquipBest = Fluent.Options.ToggleEquipBest.Value
+    saveConfig()
+end)
+
+local ToggleAutoSell = Tabs.Main:AddToggle("ToggleAutoSell", {
+    Title = "Auto Sell Pet",
+    Default = Config.AutoSell
+})
+ToggleAutoSell:OnChanged(function()
+    Config.AutoSell = Fluent.Options.ToggleAutoSell.Value
+    saveConfig()
+end)
+
+local InputMaxSell = Tabs.Main:AddInput("InputMaxSell", {
+    Title = "Sell If Under ($/s)",
+    Default = tostring(Config.MaxSellIncome),
+    Placeholder = "เช่น All, 500k, 1M, 10M",
+    Numeric = false,
+    Finished = false,
+    Callback = function(val)
+        Config.MaxSellIncome = val
+        saveConfig()
+    end
+})
+InputMaxSell:OnChanged(function()
+    Config.MaxSellIncome = Fluent.Options.InputMaxSell.Value
+    saveConfig()
+end)
+
+-- Utility Section
+Tabs.Main:AddSection("Utility")
+
+local ToggleAntiAFK = Tabs.Main:AddToggle("ToggleAntiAFK", {
+    Title = "Anti AFK",
+    Default = Config.AntiAFK
+})
+ToggleAntiAFK:OnChanged(function()
+    Config.AntiAFK = Fluent.Options.ToggleAntiAFK.Value
+    saveConfig()
+end)
+
+-- 17. Floating Mobile Toggle Button (For Delta, Fluxus, Codex, Arceus X, Hydrogen)
+local function CreateMobileToggleButton(win)
+    local screenGui = Instance.new("ScreenGui")
+    screenGui.Name = "StreetHubMobileToggle"
+    screenGui.ResetOnSpawn = false
+    screenGui.DisplayOrder = 999999
+    screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    screenGui.Parent = GetSafeGuiParent()
+
+    local btn = Instance.new("TextButton")
+    btn.Name = "ToggleIcon"
+    btn.Size = UDim2.fromOffset(48, 48)
+    btn.Position = UDim2.new(0, 30, 0.45, 0)
+    btn.AnchorPoint = Vector2.new(0.5, 0.5)
+    btn.BackgroundColor3 = Color3.fromRGB(18, 16, 22)
+    btn.Text = ""
+    btn.AutoButtonColor = false
+    btn.Active = true
+    btn.Parent = screenGui
+
+    local corner = Instance.new("UICorner", btn)
+    corner.CornerRadius = UDim.new(1, 0)
+
+    local stroke = Instance.new("UIStroke", btn)
+    stroke.Color = Color3.fromRGB(46, 168, 46)
+    stroke.Thickness = 2.2
+    stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+
+    local badgeContainer = Instance.new("Frame", btn)
+    badgeContainer.Size = UDim2.fromScale(1, 1)
+    badgeContainer.BackgroundTransparency = 1
+
+    local dinoIcon = Instance.new("TextLabel", badgeContainer)
+    dinoIcon.Size = UDim2.new(1, 0, 0, 20)
+    dinoIcon.Position = UDim2.new(0, 0, 0, 6)
+    dinoIcon.BackgroundTransparency = 1
+    dinoIcon.Text = "🦖"
+    dinoIcon.TextSize = 16
+    dinoIcon.Font = Enum.Font.GothamBold
+
+    local labelText = Instance.new("TextLabel", badgeContainer)
+    labelText.Size = UDim2.new(1, 0, 0, 12)
+    labelText.Position = UDim2.new(0, 0, 0, 26)
+    labelText.BackgroundTransparency = 1
+    labelText.Text = "HUB"
+    labelText.TextColor3 = Color3.fromRGB(255, 255, 255)
+    labelText.TextSize = 8
+    labelText.Font = Enum.Font.GothamBold
+
+    -- Mobile Touch & Mouse Dragging
+    local dragging = false
+    local dragInput, dragStart, startPos
+
+    btn.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = btn.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
+            end)
+        end
+    end)
+
+    btn.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+            dragInput = input
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if input == dragInput and dragging then
+            local delta = input.Position - dragStart
+            btn.Position = UDim2.new(
+                startPos.X.Scale,
+                startPos.X.Offset + delta.X,
+                startPos.Y.Scale,
+                startPos.Y.Offset + delta.Y
+            )
+        end
+    end)
+
+    -- Toggle Window visibility on tap
+    local lastClick = 0
+    btn.MouseButton1Click:Connect(function()
+        if os.clock() - lastClick < 0.25 then return end
+        lastClick = os.clock()
+        pcall(function()
+            if win.Minimize then
+                win:Minimize()
+            end
+        end)
+    end)
+
+    return screenGui
+end
+
+CreateMobileToggleButton(Window)
+
+Window:SelectTab(1)
+
+Fluent:Notify({
+    Title = "ALAN 🦖",
+    Content = "Pull a Dino Loaded! Account: " .. LocalPlayer.Name,
+    Duration = 5
+})
